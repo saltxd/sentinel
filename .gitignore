@@ -1,0 +1,49 @@
+# Environment and secrets
+.env
+*.env
+config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+.eggs/
+*.egg-info/
+*.egg
+
+# Data
+data/
+*.db
+*.sqlite
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.claude/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Build
+dist/
+build/
+*.manifest
+*.spec
+
+# Docker
+.docker/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,54 @@
+sentinel:
+  check_interval: 60  # seconds between collection cycles
+  escalation_cooldown: 300  # don't re-alert on same issue within this window
+
+collectors:
+  docker:
+    enabled: true
+    socket: /var/run/docker.sock
+    log_tail_lines: 100  # lines of logs to fetch per container
+
+  kubernetes:
+    enabled: false
+    # kubeconfig: ~/.kube/config  # future
+
+analysis:
+  baseline_window_hours: 24
+  min_samples_for_baseline: 10  # need this many before detecting anomalies
+  anomaly_threshold: 3.0  # standard deviations from mean
+
+  # Known issues to suppress
+  suppress_rules:
+    - pattern: "KubeControllerManagerDown"
+      context: "k3s"
+      action: suppress
+    - pattern: "KubeSchedulerDown"
+      context: "k3s"
+      action: suppress
+    - pattern: "v1 Endpoints is deprecated"
+      action: suppress_unless_burst
+      burst_threshold: 100  # per minute
+
+escalation:
+  provider: anthropic
+  model: claude-sonnet-4-20250514
+  max_tokens: 500
+
+  # Context to include in AI prompt
+  cluster_context: |
+    Homelab K3s cluster with 2 nodes.
+    Running kube-prometheus-stack for monitoring.
+    Common false positives have been filtered.
+
+notifications:
+  discord:
+    enabled: true
+    webhook_url: ${DISCORD_WEBHOOK}
+
+  slack:
+    enabled: false
+    # webhook_url: ${SLACK_WEBHOOK}
+
+storage:
+  database_path: /app/data/sentinel.db
+  retention_hours: 48  # keep metrics for 48 hours
