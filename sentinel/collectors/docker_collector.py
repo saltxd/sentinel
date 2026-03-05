@@ -13,12 +13,6 @@ from .base import BaseCollector, CollectorResult, ContainerMetrics
 
 logger = structlog.get_logger()
 
-# Timeouts for Docker operations to prevent hangs
-DOCKER_STATS_TIMEOUT = 30  # seconds
-DOCKER_LOGS_TIMEOUT = 10   # seconds
-DOCKER_INFO_TIMEOUT = 10   # seconds
-CONTAINER_TOTAL_TIMEOUT = 45  # Max time for all operations on a single container
-
 
 class DockerCollector(BaseCollector):
     """Collect metrics from Docker containers via the Docker socket."""
@@ -67,23 +61,22 @@ class DockerCollector(BaseCollector):
 
         try:
             containers = await self._client.containers.list()
-            logger.debug("collecting_containers", count=len(containers))
 
-            # Collect stats for each container concurrently with per-container timeout
+            # Collect stats for each container with per-container timeout
             tasks = [
                 asyncio.wait_for(
                     self._collect_container_metrics(container),
-                    timeout=CONTAINER_TOTAL_TIMEOUT,
+                    timeout=15.0,
                 )
                 for container in containers
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            for i, result in enumerate(results):
+            for container, result in zip(containers, results):
                 if isinstance(result, asyncio.TimeoutError):
-                    container_id = str(containers[i])[:12] if i < len(containers) else "unknown"
-                    logger.error("container_total_timeout", container=container_id, timeout=CONTAINER_TOTAL_TIMEOUT)
-                    errors.append(f"Container {container_id} timed out after {CONTAINER_TOTAL_TIMEOUT}s")
+                    name = container._id[:12]
+                    logger.warning("container_stats_timeout", container=name)
+                    errors.append(f"Timeout collecting stats for {name}")
                 elif isinstance(result, Exception):
                     errors.append(str(result))
                 elif result:
@@ -112,21 +105,15 @@ class DockerCollector(BaseCollector):
     async def _collect_container_metrics(
         self, container: aiodocker.containers.DockerContainer
     ) -> ContainerMetrics | None:
-        """Collect metrics for a single container with timeout protection."""
-        container_name = "unknown"
+        """Collect metrics for a single container."""
         try:
-            # Get container info with timeout
-            logger.debug("container_info_start", container=str(container)[:12])
-            info = await asyncio.wait_for(
-                container.show(),
-                timeout=DOCKER_INFO_TIMEOUT,
-            )
+            # Get container info
+            info = await container.show()
             container_id = info["Id"][:12]
             container_name = info["Name"].lstrip("/")
             image = info["Config"]["Image"]
             status = info["State"]["Status"]
             labels = info["Config"].get("Labels", {}) or {}
-            logger.debug("container_info_complete", container=container_name, status=status)
 
             # Calculate uptime
             started_at = info["State"].get("StartedAt", "")
@@ -154,23 +141,12 @@ class DockerCollector(BaseCollector):
 
             if status == "running":
                 try:
-                    logger.debug("container_stats_start", container=container_name)
-                    stats = await asyncio.wait_for(
-                        self._get_container_stats(container),
-                        timeout=DOCKER_STATS_TIMEOUT,
-                    )
+                    stats = await self._get_container_stats(container)
                     cpu_percent = stats.get("cpu_percent", 0.0)
                     memory_bytes = stats.get("memory_bytes", 0)
                     memory_limit = stats.get("memory_limit", 0)
                     if memory_limit > 0:
                         memory_percent = (memory_bytes / memory_limit) * 100
-                    logger.debug("container_stats_complete", container=container_name, cpu=cpu_percent)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "stats_fetch_timeout",
-                        container=container_name,
-                        timeout=DOCKER_STATS_TIMEOUT,
-                    )
                 except Exception as e:
                     logger.warning(
                         "stats_fetch_failed",
@@ -178,16 +154,10 @@ class DockerCollector(BaseCollector):
                         error=str(e),
                     )
 
-            # Get recent logs with timeout
-            logger.debug("container_logs_start", container=container_name, tail=self.config.log_tail_lines)
-            try:
-                recent_logs = await asyncio.wait_for(
-                    self._get_container_logs(container, self.config.log_tail_lines, container_name),
-                    timeout=DOCKER_LOGS_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                logger.warning("container_logs_timeout_outer", container=container_name, timeout=DOCKER_LOGS_TIMEOUT)
-                recent_logs = []
+            # Get recent logs
+            recent_logs = await self._get_container_logs(
+                container, self.config.log_tail_lines
+            )
 
             return ContainerMetrics(
                 container_id=container_id,
@@ -204,12 +174,6 @@ class DockerCollector(BaseCollector):
                 recent_logs=recent_logs,
             )
 
-        except asyncio.TimeoutError:
-            logger.warning(
-                "container_metrics_timeout",
-                container=str(container),
-            )
-            return None
         except Exception as e:
             logger.warning(
                 "container_metrics_failed",
@@ -221,35 +185,18 @@ class DockerCollector(BaseCollector):
     async def _get_container_stats(
         self, container: aiodocker.containers.DockerContainer
     ) -> dict[str, Any]:
-        """Get CPU and memory stats for a container with timeout protection.
-
-        This method can hang if the Docker daemon is slow or unresponsive,
-        so it should always be called with a timeout wrapper.
-        """
-        # Get a single stats snapshot (stream=False equivalent)
+        """Get CPU and memory stats for a container."""
         stats_generator = container.stats(stream=True)
 
         try:
-            # Get first stats reading with timeout protection
-            # The generator itself can hang, so we wrap each call
             stats1 = await asyncio.wait_for(
-                stats_generator.__anext__(),
-                timeout=10,
+                stats_generator.__anext__(), timeout=5.0
             )
-            # Need a second reading for CPU calculation
             stats2 = await asyncio.wait_for(
-                stats_generator.__anext__(),
-                timeout=10,
+                stats_generator.__anext__(), timeout=5.0
             )
         finally:
-            # Clean up the generator - this can also hang in rare cases
-            try:
-                await asyncio.wait_for(
-                    stats_generator.aclose(),
-                    timeout=2,
-                )
-            except asyncio.TimeoutError:
-                logger.warning("stats_generator_close_timeout")
+            await stats_generator.aclose()
 
         # Calculate CPU percentage
         cpu_delta = (
@@ -278,34 +225,17 @@ class DockerCollector(BaseCollector):
         }
 
     async def _get_container_logs(
-        self, container: aiodocker.containers.DockerContainer, tail: int, container_name: str = "unknown"
+        self, container: aiodocker.containers.DockerContainer, tail: int
     ) -> list[str]:
-        """Get recent log lines from a container with explicit timeout protection."""
+        """Get recent log lines from a container."""
         try:
-            # Add explicit timeout at the lowest level to catch hung I/O
-            logs = await asyncio.wait_for(
-                container.log(
-                    stdout=True,
-                    stderr=True,
-                    tail=tail,
-                ),
-                timeout=5.0,  # Aggressive 5-second timeout
+            logs = await container.log(
+                stdout=True,
+                stderr=True,
+                tail=tail,
             )
             # logs is a list of log lines
-            result = [line.strip() for line in logs if line.strip()]
-            logger.debug(
-                "log_fetch_complete",
-                container=container_name,
-                lines=len(result),
-            )
-            return result
-        except asyncio.TimeoutError:
-            logger.warning(
-                "log_fetch_timeout_inner",
-                container=container_name,
-                timeout=5.0,
-            )
-            return []
+            return [line.strip() for line in logs if line.strip()]
         except Exception as e:
-            logger.warning("log_fetch_failed", container=container_name, error=str(e))
+            logger.warning("log_fetch_failed", error=str(e))
             return []
